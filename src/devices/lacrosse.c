@@ -31,6 +31,8 @@
 // buffer to hold localized timestamp YYYY-MM-DD HH:MM:SS
 #define LOCAL_TIME_BUFLEN	32
 
+// XXX move this utility function some place better
+
 void local_time_str(time_t time_secs, char *buf) {
 	time_t etime;
 	struct tm *tm_info;

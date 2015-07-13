@@ -756,6 +756,134 @@ static void pwm_p_decode(struct dm_state *demod, struct protocol_state* p, int16
     }
 }
 
+
+/* 
+ * Decoder for when No signal is sent during a zero period
+ * Length of gaps must be counted to determine number of zero bits
+ * Has long start pulse which is discarded.
+ * Long limit needs to be < 1.25 * actual start bit length
+ *
+ * Used for DSC security contacts
+ */
+
+
+static void pwm_silent0_decode(struct dm_state *demod, struct protocol_state* p, int16_t *buf, uint32_t len) {
+    unsigned int i;
+    int long_limit_margin = p->long_limit * .40;  
+    int short_limit_margin = p->short_limit * .33; 
+    int quiet_periods, nz;
+
+    for (i = 0; i < len; i++) {
+        if (buf[i] > demod->level_limit && !p->start_bit) {
+            /* start bit detected */
+            p->start_bit = 1;
+            p->start_c = 1;
+            p->sample_counter = 0;
+            //            fprintf(stderr, "start bit pulse start detected\n");
+        }
+
+        if (!p->real_bits && p->start_bit && (buf[i] < demod->level_limit)) {
+            /* end of startbit */
+	    if (p->sample_counter >= (p->long_limit - long_limit_margin) &&
+		p->sample_counter <= p->long_limit) {
+		p->real_bits = 1;
+		p->sample_counter = 0;
+		p->pulse_distance = 0;
+                //       fprintf(stderr, "silent0: start bit pulse end detected\n");
+	    } else {
+		// XXX temp for debugging, is it even close
+		if (p->sample_counter >= (p->long_limit - long_limit_margin * 1.1) &&
+		    p->sample_counter <= (p->long_limit + long_limit_margin * 1.1)) {
+		 fprintf(stderr,"silent0: invalid start pulse length %d (should be %d - %d)\n",
+			p->sample_counter, p->long_limit - long_limit_margin, p->long_limit);
+		}
+		p->start_bit = 0;
+		p->start_c = 0;
+		p->sample_counter = 0;
+		p->pulse_distance = 0;
+	    }
+        }
+
+        if (p->start_c) p->sample_counter++;
+
+
+        if (!p->pulse_start && p->real_bits && (buf[i] > demod->level_limit)) {
+	    // start of real (data) bit detected
+
+	    // fprintf(stderr, "real bit pulse start detected, space distance %d sample counter %d\n",p->pulse_distance,p->sample_counter);
+            p->pulse_start = p->sample_counter;   // to determine pulse_length
+	    p->pulse_distance = p->sample_counter;
+	    // Determine how many quiet periods have occured
+	    if (p->pulse_distance > p->short_limit) {
+		// quiet_periods = p->pulse_distance / ((p->short_limit - short_limit_margin) * 2);
+		// quiet_periods = p->pulse_distance / (p->short_limit * 2);
+		// quiet_periods = p->pulse_distance / ((p->short_limit + short_limit_margin) * 2);
+		quiet_periods = p->pulse_distance / (62.5 * 2);
+		fprintf(stderr, "silent0: pulse_distance %d, Adding %d zero bits\n", p->pulse_distance, quiet_periods);
+		for (nz = 0; nz < quiet_periods; nz++) {
+		    demod_add_bit(p, 0);
+		}
+
+	    } else {
+		// XXX temp debug
+		fprintf(stderr, "silent0: pulse_distance %d, no 0 bits\n", p->pulse_distance);
+	    }
+        }
+
+        if (p->real_bits && p->pulse_start && (buf[i] < demod->level_limit)) {
+            /* end of pulse */
+
+            p->pulse_length = p->sample_counter - p->pulse_start; 
+	    // fprintf(stderr, "silent0: real bit pulse end detected length: %d, leading space duration %d\n", p->pulse_length,p->sample_counter);
+
+
+            if (p->pulse_length <= (p->short_limit + short_limit_margin) &&
+		p->pulse_length >= (p->short_limit - short_limit_margin)) {
+                demod_add_bit(p, 1);
+            } else if (p->pulse_length > p->short_limit) {
+		// XXX temp for debugging, report pulses that are close
+		if (p->pulse_length >= (p->short_limit - short_limit_margin * 1.2) &&
+		    p->pulse_length <= (p->short_limit + short_limit_margin * 1.2)) {
+		    fprintf(stderr,"silent0: Invalid data bit pulse length %d\n",p->pulse_length);
+		}
+		// XXX TODO RESET??
+
+            }
+            p->sample_counter = 0;
+            p->pulse_start = 0;
+	    p->pulse_distance = 0;
+        }
+
+
+        if (p->sample_counter > p->reset_limit) {
+            p->start_c = 0;
+            p->sample_counter = 0;
+            //demod_print_bits_packet(p);
+            if (p->callback) {
+		// We don't know how many zero bits are in the last byte
+		// So pad with 8 zero bits to ensure last byte is included
+		// in case last byte was all zeros.
+		// XXX this needs to be checked, 
+		quiet_periods = p->pulse_distance / ((p->short_limit - short_limit_margin) * 2);
+		fprintf(stderr,"silent0: reset_limit reached, pulse_distance %d, sample_counter %d, quiet periods %d\n",
+			p->pulse_distance, p->sample_counter, quiet_periods);
+		// for (nz = 0; nz < quiet_periods; nz++) {
+		//    demod_add_bit(p, 0);
+		// }
+                events += p->callback(p->bits_buffer, p->bits_per_row);
+            } else {
+                demod_print_bits_packet(p);
+	    }
+            demod_reset_bits_packet(p);
+
+            p->start_bit = 0;
+            p->real_bits = 0;
+	    p->pulse_distance = 0;
+        }
+    }
+}
+
+
 /*  Machester Decode for Oregon Scientific Weather Sensors
    Decode data streams sent by Oregon Scientific v2.1, and v3 weather sensors.
    With manchester encoding, both the pulse width and pulse distance vary.  Clock sync
@@ -937,6 +1065,10 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
                     case OOK_PWM_RAW:
                         pwm_raw_decode(demod, demod->r_devs[i], demod->f_buf, len / 2);
                         break;
+		    case OOK_PWM_S0:
+		        pwm_silent0_decode(demod, demod->r_devs[i], demod->f_buf, len / 2);
+			break;
+
                     default:
                         fprintf(stderr, "Unknown modulation %d in protocol!\n", demod->r_devs[i]->modulation);
                 }
