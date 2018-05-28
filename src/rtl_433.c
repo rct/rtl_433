@@ -53,6 +53,10 @@ int debug_output = 0;
 int quiet_mode = 0;
 int utc_mode = 0;
 int overwrite_mode = 0;
+int report_level = 0;
+int report_interval = 60; // seconds
+int report_now = 0;
+time_t report_time;
 
 typedef enum  {
     CONVERT_NATIVE,
@@ -163,6 +167,11 @@ void usage(r_device *devices) {
     exit(1);
 }
 
+// TODO: SIGINFO is not in POSIX...
+#ifndef SIGINFO
+#define SIGINFO 29
+#endif
+
 #ifdef _WIN32
 BOOL WINAPI
 sighandler(int signum) {
@@ -177,7 +186,10 @@ sighandler(int signum) {
 #else
 static void sighandler(int signum) {
     if (signum == SIGPIPE) {
-        signal(SIGPIPE,SIG_IGN);
+        signal(SIGPIPE, SIG_IGN);
+    } else if (signum == SIGINFO/* TODO: maybe SIGUSR1 */) {
+        report_now++;
+        return;
     } else if (signum == SIGALRM) {
         fprintf(stderr, "Async read stalled, exiting!\n");
     } else {
@@ -188,6 +200,59 @@ static void sighandler(int signum) {
 }
 #endif
 
+// level 0: do not report (don't call this), 1: report successful devices, 2: report active devices, 3: report all
+static data_t *create_report_data(struct dm_state *demod, int level)
+{
+    data_t *data;
+    data_t *dev_data[MAX_PROTOCOLS];
+    struct protocol_state *p;
+    int r, i = 0;
+
+    for (r = 0; r < demod->r_dev_num; r++) {
+        p = demod->r_devs[r];
+        if (level <= 2 && p->decode_events == 0)
+            continue;
+        if (level <= 1 && p->decode_ok == 0)
+            continue;
+        if (level <= 0)
+            continue;
+        dev_data[i++] = data_make(
+                "device",       "", DATA_INT, r,
+                "name",         "", DATA_STRING, p->name,
+                "events",       "", DATA_INT, p->decode_events,
+                "ok",           "", DATA_INT, p->decode_ok,
+                "messages",     "", DATA_INT, p->decode_messages,
+                "fail_other",   "", DATA_INT, p->decode_fails[-DECODE_FAIL_OTHER],
+                "abort_length", "", DATA_INT, p->decode_fails[-DECODE_ABORT_LENGTH],
+                "abort_early",  "", DATA_INT, p->decode_fails[-DECODE_ABORT_EARLY],
+                "fail_mic",     "", DATA_INT, p->decode_fails[-DECODE_FAIL_MIC],
+                "fail_sanity",  "", DATA_INT, p->decode_fails[-DECODE_FAIL_SANITY],
+                NULL);
+    }
+
+    return data_make(
+            "enabled",          "", DATA_INT, demod->r_dev_num,
+            "stats",            "", DATA_ARRAY, data_array(i, DATA_DATA, dev_data),
+            NULL);
+}
+
+static void flush_report_data(struct dm_state *demod)
+{
+    int i;
+    struct protocol_state *p;
+
+    for (i = 0; i < demod->r_dev_num; i++) {
+        p = demod->r_devs[i];
+        p->decode_events = 0;
+        p->decode_ok = 0;
+        p->decode_messages = 0;
+        p->decode_fails[0] = 0;
+        p->decode_fails[1] = 0;
+        p->decode_fails[2] = 0;
+        p->decode_fails[3] = 0;
+        p->decode_fails[4] = 0;
+    }
+}
 
 static void register_protocol(struct dm_state *demod, r_device *t_dev) {
     struct protocol_state *p = calloc(1, sizeof (struct protocol_state));
@@ -857,6 +922,13 @@ static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
         rtlsdr_cancel_async(dev);
         fprintf(stderr, "Time expired, exiting!\n");
     }
+    if (report_now || (report_interval && rawtime >= report_time)) {
+        data_acquired_handler(create_report_data(demod, report_level));
+        flush_report_data(demod);
+        report_time += report_interval;
+        if (report_now)
+            report_now--;
+    }
 }
 
 // find the fields output for CSV
@@ -1029,7 +1101,7 @@ int main(int argc, char **argv) {
     demod->level_limit = DEFAULT_LEVEL_LIMIT;
     demod->hop_time = DEFAULT_HOP_TIME;
 
-    while ((opt = getopt(argc, argv, "x:z:p:DtaAI:qm:r:l:d:f:H:g:s:b:n:SR:X:F:C:T:UWGy:E")) != -1) {
+    while ((opt = getopt(argc, argv, "x:z:p:DtaAI:qm:r:l:d:f:H:g:s:b:n:SR:X:F:C:T:UWGy:EL:")) != -1) {
         switch (opt) {
             case 'd':
                 dev_query = optarg;
@@ -1173,6 +1245,12 @@ int main(int argc, char **argv) {
             case 'E':
                 stop_after_successful_events_flag = 1;
                 break;
+            case 'L':
+                // there also should be options to set report_interval and wether to flush on report
+                report_level = atoi(optarg);
+                time(&report_time);
+                report_time += report_interval;
+                break;
             default:
                 usage(devices);
                 break;
@@ -1286,6 +1364,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sigact, NULL);
     sigaction(SIGQUIT, &sigact, NULL);
     sigaction(SIGPIPE, &sigact, NULL);
+    sigaction(SIGINFO, &sigact, NULL);
 #else
     SetConsoleCtrlHandler((PHANDLER_ROUTINE) sighandler, TRUE);
 #endif
@@ -1504,6 +1583,11 @@ int main(int argc, char **argv) {
 
     if (demod->out_file && (demod->out_file != stdout))
         fclose(demod->out_file);
+
+    if (report_level > 0) {
+        data_acquired_handler(create_report_data(demod, report_level));
+        flush_report_data(demod);
+    }
 
     for (i = 0; i < demod->r_dev_num; i++)
         free(demod->r_devs[i]);
