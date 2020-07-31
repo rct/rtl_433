@@ -436,19 +436,20 @@ Acurite Atlas Message Type Format:
 Message Type 0x25 (Wind Speed, Temperature, Relative Humidity, ???)
 
     Byte 1   Byte 2   Byte 3   Byte 4   Byte 5   Byte 6   Byte 7   Byte 8   Byte 9   Byte 10
-    cc??ssdd dddddddd pb011011 pWWWWWWW pWTTTTTT pTTTTTTT pHHHHHHH pCCCCCCC pCCDDDDD kkkkkkkkk
+    cc??ssdd dddddddd pb011011 pWWWWWWW pW??TTTT pTTTTTTT pHHHHHHH pCCCCCCC pCCDDDDD kkkkkkkkk
 
 Note: 13 bits for Temp is too much, should only be 11 bits.
+@todo - Do the bits (byte 5 & 0x30) have any meaning, or are they just not reliably cleared?
 
 Message Type 0x26 (Wind Speed, Wind Vector, Rain Counter, ???)
 
     Byte 1   Byte 2   Byte 3   Byte 4   Byte 5   Byte 6   Byte 7   Byte 8   Byte 9   Byte 10
-    cc??ssdd dddddddd pb011100 pWWWWWWW pW?VVVVV pVVVVVRR pRRRRRRR pCCCCCCC pCCDDDDD kkkkkkkkk
+    cc??ssdd dddddddd pb011100 pWWWWWWW pW??VVVV pVVVVVRR pRRRRRRR pCCCCCCC pCCDDDDD kkkkkkkkk
 
     CHANNEL:2b xx ~SEQ:2d ~DEVICE:10d xx ~TYPE:6h SPEED:x~7bx~1b DIR:x~5bx~5bxx x~7b x~7b x~7b CHK:8h
 
 Note: 10 bits for Vector is too much, should only be 9 bits.
-Note: 7 bits for Rain not enough, should reasonably be 10 bits.
+@todo - Do the bits (byte 5 & 0x30) have any meaning, or are they just not reliably cleared?
 
 Message Type 0x27 (Wind Speed, UV and Lux data)
 
@@ -458,6 +459,7 @@ Message Type 0x27 (Wind Speed, UV and Lux data)
 Note: 6 bits for UV is too much, should only be 4 bits.
 JRH - Definitely only 4 bits, seeing the occasional value of 32 or 34. No idea what the 2 bits between
       wind speed and UV are.
+@todo - Do the bits (byte 5 & 0x30) have any meaning, or are they just not reliably cleared?
 
     CHANNEL:2b xx ~SEQ:2d ~DEVICE:10d xx ~TYPE:6h SPEED:x~7bx~1b UV:~6d LUX:x~7bx~7b x~7b x~7b CHK:8h
 
@@ -560,6 +562,9 @@ static int acurite_atlas_decode(r_device *decoder, bitbuffer_t *bitbuffer, unsig
 
         humidity = (bb[6] & 0x7f); // 1-99 %rH
 
+        // temperature is only 4 bits of bb[4], check unused bit for possible undecoded data/flags
+        if ((bb[4] & 0x30) != 0) exception++;
+
         /* clang-format off */
         data = data_append(data,
                 "temperature_F",    "temperature",  DATA_FORMAT,    "%.1f F",       DATA_DOUBLE, tempf,
@@ -571,11 +576,15 @@ static int acurite_atlas_decode(r_device *decoder, bitbuffer_t *bitbuffer, unsig
     if (message_type == ACURITE_MSGTYPE_ATLAS_WNDSPD_RAIN ||
         message_type == ACURITE_MSGTYPE_ATLAS_WNDSPD_RAIN_LTNG) {
         // Wind speed, wind direction, and rain fall
+        // @todo wind_dir is probably only 9 bits
         wind_dir = ((bb[4] & 0x1f) << 5) | ((bb[5] & 0x7c) >> 2);
 
         // range: 0 to 5.11 in, 0.01 inch increments, accumulated
         // JRH: Confirmed 9 bits, counter rolls over after 5.11 inches
         raincounter = ((bb[5] & 0x03) << 7) | (bb[6] & 0x7F);
+
+        // wind_dir is only 4 or 5(?) bits of bb[4], check unused bit for possible undecoded data/flags
+        if ((bb[4] & 0x30) != 0) exception++;
 
         /* clang-format off */
         data = data_append(data,
@@ -590,6 +599,9 @@ static int acurite_atlas_decode(r_device *decoder, bitbuffer_t *bitbuffer, unsig
         // Wind speed, UV Index, Light Intensity, Lightning?
         int uv = (bb[4] & 0x0f);
         int lux = ((bb[5] & 0x7f) << 7) | (bb[6] & 0x7F);
+
+        // UV is only 4 bits, check unused bits for possible undecoded data/flags
+        if (bb[4] & 0x30) != 0) exception++;
 
         /* clang-format off */
         data = data_append(data,
